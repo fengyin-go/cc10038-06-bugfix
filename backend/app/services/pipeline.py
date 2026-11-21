@@ -7,10 +7,16 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import re
+import threading
 import time
 from typing import Any
 
 from app.store import store
+
+# 聚合视图发布与分组导出共用一把锁：导出在锁内完成取数与交付清单回写，
+# 刷新在锁内发布新修订，保证并发时只会发布一份可核对筛选依据的完整文件。
+_VIEW_EXPORT_LOCK = threading.RLock()
 
 
 def _now_iso() -> str:
@@ -409,7 +415,11 @@ class IngestPipeline:
         metric_field: str,
         agg_func: str = "count",
     ) -> dict[str, Any]:
-        """基于标准化明细刷新聚合视图。"""
+        """基于标准化明细刷新聚合视图。
+
+        每次刷新为同名视图发布一个递增的视图修订，旧修订连同分组切片
+        完整保留，供在途导出按修订取数、血缘按修订核对分组来源。
+        """
         parsed = store.rows("parsed_entity")
         results: dict[str, dict[str, Any]] = {}
 
@@ -424,98 +434,206 @@ class IngestPipeline:
             dim_val = str(fields_data.get(dim_field, "unknown"))
             metric_val = fields_data.get(metric_field, "0")
 
-            if dim_val not in results:
-                results[dim_val] = {"count": 0, "sum": 0.0, "values": []}
-
-            results[dim_val]["count"] += 1
+            group = results.setdefault(dim_val, {
+                "count": 0,
+                "sum": 0.0,
+                "values": [],
+                "source_ids": [],
+                "batches": [],
+                "parser_rules": [],
+            })
+            group["count"] += 1
             try:
-                results[dim_val]["sum"] += float(metric_val) if metric_val else 0.0
+                group["sum"] += float(metric_val) if metric_val else 0.0
             except (ValueError, TypeError):
                 pass
-            results[dim_val]["values"].append(metric_val)
+            group["values"].append(metric_val)
+            group["source_ids"].append(entity.get("id"))
+            batch_no = str(entity.get("来源批次", "") or "")
+            if batch_no and batch_no not in group["batches"]:
+                group["batches"].append(batch_no)
+            rule_ver = str(entity.get("解析规则版本", "") or "")
+            if rule_ver and rule_ver not in group["parser_rules"]:
+                group["parser_rules"].append(rule_ver)
 
-        # 创建/更新聚合视图
+        # 发布新视图修订：与并发导出互斥，保证修订号单调且切片完整
         aggs = store.rows("aggregation_view")
-        agg_entry = {
-            "id": _next_id("aggregation_view"),
-            "视图名称": view_name,
-            "聚合维度": dim_field,
-            "指标定义": f"{agg_func}({metric_field})",
-            "数据源范围": "标准化明细",
-            "刷新间隔": "manual",
-            "status": "已生效",
-            "pending": False,
-            "abnormal": False,
-            "results": results,
-            "refreshed_at": _now_iso(),
-            "source_records": len(parsed),
-        }
-        aggs.append(agg_entry)
+        with _VIEW_EXPORT_LOCK:
+            revision = max(
+                (int(a.get("view_revision", 1)) for a in aggs
+                 if a.get("视图名称") == view_name),
+                default=0,
+            ) + 1
+            for a in aggs:
+                if a.get("视图名称") == view_name:
+                    a["is_latest"] = False
+            agg_entry = {
+                "id": _next_id("aggregation_view"),
+                "视图名称": view_name,
+                "聚合维度": dim_field,
+                "指标定义": f"{agg_func}({metric_field})",
+                "数据源范围": "标准化明细",
+                "刷新间隔": "manual",
+                "status": "已生效",
+                "pending": False,
+                "abnormal": False,
+                "view_revision": revision,
+                "is_latest": True,
+                "results": results,
+                "refreshed_at": _now_iso(),
+                "source_records": len(parsed),
+            }
+            aggs.append(agg_entry)
 
         return {
             "ok": True,
-            "message": f"聚合视图 {view_name} 已刷新",
+            "message": f"聚合视图 {view_name} 已刷新为修订 r{revision}",
             "view": agg_entry,
+            "view_revision": revision,
             "dimensions": len(results),
         }
 
     # ---------- 阶段6：数据导出 ----------
+    # 过滤条件里可用于定位分组的级别字段别名，兼容已有的级别条件字段
+    LEVEL_FILTER_KEYS = ("level", "级别", "log_level")
+
+    def _match_view_groups(
+        self,
+        view: dict[str, Any],
+        filters: dict[str, str] | None,
+    ) -> dict[str, dict[str, Any]]:
+        """按过滤条件在视图分组上取数，只返回实际命中的分组切片。"""
+        results = view.get("results") or {}
+        if not filters:
+            return copy.deepcopy(results)
+
+        dim_field = str(view.get("聚合维度", "") or "")
+        accepted_keys = {dim_field, *self.LEVEL_FILTER_KEYS} - {""}
+        wanted: list[str] = []
+        for key, raw_value in filters.items():
+            if key not in accepted_keys:
+                continue
+            for token in re.split(r"[,|、\s]+", str(raw_value)):
+                token = token.strip()
+                if token:
+                    wanted.append(token.casefold())
+        if not wanted:
+            # 条件里没有可识别的级别字段：不命中任何分组，照实导出空范围
+            return {}
+
+        return {
+            group_key: copy.deepcopy(group)
+            for group_key, group in results.items()
+            if str(group_key).casefold() in wanted
+        }
+
+    @staticmethod
+    def _group_export_row(group_key: str, group: dict[str, Any]) -> dict[str, Any]:
+        """日志分组导出文件的一行：分组号、行数和切片来源。"""
+        return {
+            "分组": group_key,
+            "记录数": group.get("count", 0),
+            "指标合计": group.get("sum", 0.0),
+            "来源批次": ",".join(group.get("batches", [])),
+            "来源记录数": len(group.get("source_ids", [])),
+        }
+
     def build_export(
         self,
         view_name: str,
         export_format: str = "csv",
         filters: dict[str, str] | None = None,
     ) -> dict[str, Any]:
-        """从聚合视图或标准化明细生成导出数据。"""
+        """从聚合视图生成日志分组导出文件。
+
+        导出绑定请求到达时该视图的最新修订，按过滤条件取实际命中的分组
+        切片；整个取数与交付清单回写在锁内一次完成。刷新并发发布新修订
+        （例如两个级别分组合并）时，在途的按名下载请求仍只发布一份完整
+        文件，文件、交付清单与血缘都记录同一视图修订，可互相核对。
+        """
         exports = store.rows("data_export")
         lineages = store.rows("data_lineage")
 
-        # 查找目标视图
-        aggs = store.rows("aggregation_view")
-        view = None
-        for a in aggs:
-            if a.get("视图名称") == view_name:
-                view = a
-                break
+        with _VIEW_EXPORT_LOCK:
+            aggs = store.rows("aggregation_view")
+            revisions = [a for a in aggs if a.get("视图名称") == view_name]
+            if not revisions:
+                return {"ok": False, "message": f"聚合视图 {view_name} 不存在，无法导出"}
+            view = max(revisions, key=lambda a: int(a.get("view_revision", 1)))
+            revision = int(view.get("view_revision", 1))
 
-        results_data = view.get("results", {}) if view else {}
+            matched = self._match_view_groups(view, filters)
+            matched_keys = list(matched.keys())
+            rows = [self._group_export_row(key, matched[key]) for key in matched_keys]
 
-        export_id = _next_id("data_export")
-        export_entry = {
-            "id": export_id,
-            "导出范围": view_name,
-            "目标格式": export_format,
-            "过滤条件": json.dumps(filters or {}, ensure_ascii=False),
-            "导出状态": "",
-            "文件路径": f"/exports/{view_name}.{export_format}",
-            "status": "已完成",
-            "pending": False,
-            "abnormal": False,
-            "results": results_data,
-            "record_count": len(results_data),
-            "exported_at": _now_iso(),
-        }
-        exports.append(export_entry)
+            # 切片来源：实际命中的分组贡献了哪些批次和解析规则版本
+            source_batches: list[str] = []
+            parser_rules: list[str] = []
+            for group in matched.values():
+                for batch_no in group.get("batches", []):
+                    if batch_no not in source_batches:
+                        source_batches.append(batch_no)
+                for rule_ver in group.get("parser_rules", []):
+                    if rule_ver not in parser_rules:
+                        parser_rules.append(rule_ver)
 
-        # 记录血缘
-        lineage_entry = {
-            "id": _next_id("data_lineage"),
-            "来源批次": view_name,
-            "解析规则版本": view.get("视图名称", "unknown") if view else "unknown",
-            "标准化版本": view_name,
-            "下游消费标识": f"export-{export_id}",
-            "记录时间": _now_iso(),
-            "status": "已记录",
-            "pending": False,
-            "abnormal": False,
-            "export_id": str(export_id),
-            "export_format": export_format,
-        }
-        lineages.append(lineage_entry)
+            # 交付清单先登记下载请求，文件完成后回写结果
+            export_id = _next_id("data_export")
+            lineage_id = _next_id("data_lineage")
+            file_path = f"/exports/{view_name}-r{revision}-{export_id}.{export_format}"
+            export_entry = {
+                "id": export_id,
+                "导出范围": view_name,
+                "目标格式": export_format,
+                "过滤条件": json.dumps(filters or {}, ensure_ascii=False),
+                "导出状态": "执行中",
+                "文件路径": file_path,
+                "status": "执行中",
+                "pending": True,
+                "abnormal": False,
+                "view_name": view_name,
+                "view_revision": revision,
+                "matched_groups": matched_keys,
+                "group_count": len(matched_keys),
+                "results": matched,
+                "rows": rows,
+                "record_count": len(rows),
+                "lineage_id": str(lineage_id),
+                "exported_at": _now_iso(),
+            }
+            exports.append(export_entry)
+
+            # 采集血缘按导出文件实际使用的切片登记来源
+            lineage_entry = {
+                "id": lineage_id,
+                "来源批次": ",".join(source_batches),
+                "解析规则版本": ",".join(parser_rules),
+                "标准化版本": f"{view_name}#r{revision}",
+                "下游消费标识": f"export-{export_id}",
+                "记录时间": _now_iso(),
+                "status": "已记录",
+                "pending": False,
+                "abnormal": False,
+                "export_id": str(export_id),
+                "export_format": export_format,
+                "view_name": view_name,
+                "view_revision": revision,
+                "matched_groups": matched_keys,
+                "group_count": len(matched_keys),
+                "record_count": len(rows),
+                "file_path": file_path,
+                "filter_basis": json.dumps(filters or {}, ensure_ascii=False),
+            }
+            lineages.append(lineage_entry)
+
+            # 回写交付清单：文件完成，筛选依据与分组切片可核对
+            export_entry["导出状态"] = "已完成"
+            export_entry["status"] = "已完成"
+            export_entry["pending"] = False
 
         return {
             "ok": True,
-            "message": f"数据导出 {view_name}.{export_format} 完成",
+            "message": f"数据导出 {view_name} r{revision} 完成，命中分组 {len(matched_keys)} 个",
             "export": export_entry,
             "lineage": lineage_entry,
         }

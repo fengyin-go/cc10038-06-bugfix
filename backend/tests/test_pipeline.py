@@ -6,6 +6,7 @@ aggregation_view → data_export)."""
 from __future__ import annotations
 
 import json
+import threading
 import pytest
 
 from app.store import store
@@ -422,9 +423,170 @@ class TestFullPipeline:
         assert wm[0]["status"] == "正常"
 
 
+class TestExportLineageChain:
+    """聚合取数 → 日志分组导出 → 采集血缘链路测试。"""
+
+    def _make_view(self, pipeline, source_id, levels, view_name):
+        """采集一批给定级别的日志并刷新出聚合视图，返回批次编号。"""
+        pipeline.register_source(source_id, "http", "default")
+        pipeline.validate_source(source_id)
+        logs = [
+            {"body": f"2026-01-15T10:{30 + i}:00|{level}|msg-{i}"}
+            for i, level in enumerate(levels)
+        ]
+        batch = pipeline.start_ingest_batch(source_id, "2026Q1", logs)
+        batch_no = batch["batch"]["批次编号"]
+        pipeline.parse_batch(batch_no)
+        pipeline.validate_entities(batch_no)
+        pipeline.refresh_aggregation(view_name, "level", "time", "count")
+        return batch_no
+
+    def _merge_levels(self, merged="INFO+WARN"):
+        """模拟刷新前级别分组合并：所有标准化明细的级别改写为合并值。"""
+        for entity in store.rows("parsed_entity"):
+            try:
+                fields = json.loads(entity.get("标准化字段集", "{}"))
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if "level" not in fields:
+                continue
+            fields["level"] = merged
+            entity["标准化字段集"] = json.dumps(fields, ensure_ascii=False)
+
+    def test_export_filters_level_groups(self, pipeline):
+        """筛 WARN 的成品不得再带 INFO 分组。"""
+        self._make_view(pipeline, "warn-src",
+                        ["INFO", "WARN", "INFO", "WARN", "WARN"], "level-view")
+        result = pipeline.build_export("level-view", "csv", {"level": "WARN"})
+        assert result["ok"] is True
+        export = result["export"]
+        assert export["matched_groups"] == ["WARN"]
+        assert export["record_count"] == 1
+        assert [row["分组"] for row in export["rows"]] == ["WARN"]
+        assert export["rows"][0]["记录数"] == 3
+        assert "INFO" not in export["results"]
+
+    def test_export_accepts_existing_level_field_aliases(self, pipeline):
+        """兼容已有的级别条件字段：level 与中文别名都生效。"""
+        self._make_view(pipeline, "alias-src", ["INFO", "WARN"], "alias-view")
+        by_level = pipeline.build_export("alias-view", "csv", {"level": "WARN"})
+        by_alias = pipeline.build_export("alias-view", "csv", {"级别": "WARN"})
+        assert by_level["export"]["matched_groups"] == ["WARN"]
+        assert by_alias["export"]["matched_groups"] == ["WARN"]
+
+    def test_export_empty_scope_when_level_has_no_rows(self, pipeline):
+        """级别没有行时成品照实反映空范围，血缘仍可核对分组来源。"""
+        self._make_view(pipeline, "empty-src", ["INFO", "WARN"], "empty-view")
+        result = pipeline.build_export("empty-view", "csv", {"level": "DEBUG"})
+        export = result["export"]
+        assert export["status"] == "已完成"
+        assert export["matched_groups"] == []
+        assert export["rows"] == []
+        assert export["record_count"] == 0
+        lineage = result["lineage"]
+        assert lineage["group_count"] == 0
+        assert lineage["来源批次"] == ""
+        assert lineage["view_revision"] == export["view_revision"]
+
+    def test_export_missing_view_rejected(self, pipeline):
+        result = pipeline.build_export("ghost-view", "csv", {"level": "WARN"})
+        assert result["ok"] is False
+
+    def test_export_and_lineage_cross_reference(self, pipeline):
+        """文件能查到视图修订和分组，导出与血缘两个结果可互相关联。"""
+        batch_no = self._make_view(pipeline, "xref-src", ["WARN", "WARN"], "xref-view")
+        result = pipeline.build_export("xref-view", "csv", {"level": "WARN"})
+        export, lineage = result["export"], result["lineage"]
+        assert export["lineage_id"] == str(lineage["id"])
+        assert lineage["export_id"] == str(export["id"])
+        assert lineage["下游消费标识"] == f"export-{export['id']}"
+        assert lineage["标准化版本"] == f"xref-view#r{export['view_revision']}"
+        assert lineage["来源批次"] == batch_no
+        assert lineage["file_path"] == export["文件路径"]
+        assert lineage["matched_groups"] == export["matched_groups"]
+
+    def test_revision_pinned_when_refresh_merges_groups(self, pipeline):
+        """先订 WARN 文件，再让刷新合并级别：两份成品各自绑定可核对的修订。"""
+        self._make_view(pipeline, "merge-src", ["INFO", "WARN", "WARN"], "merge-view")
+
+        # 合并前订一份 WARN 文件：绑定修订 r1
+        first = pipeline.build_export("merge-view", "csv", {"level": "WARN"})
+        assert first["export"]["view_revision"] == 1
+        assert first["export"]["matched_groups"] == ["WARN"]
+        assert first["export"]["rows"][0]["记录数"] == 2
+
+        # 刷新把原来的两个级别分组合并，发布修订 r2
+        self._merge_levels()
+        pipeline.refresh_aggregation("merge-view", "level", "time", "count")
+
+        # 用户仍持有按合并前名称发出的下载请求：绑定新修订，照实反映空范围
+        second = pipeline.build_export("merge-view", "csv", {"level": "WARN"})
+        assert second["export"]["view_revision"] == 2
+        assert second["export"]["matched_groups"] == []
+        assert second["export"]["rows"] == []
+
+        # 两份成品的行内容与血缘中的分组号都能核对到各自修订
+        lineages = {l["export_id"]: l for l in store.rows("data_lineage")
+                    if l.get("export_id")}
+        lin1 = lineages[str(first["export"]["id"])]
+        lin2 = lineages[str(second["export"]["id"])]
+        assert lin1["view_revision"] == 1 and lin1["matched_groups"] == ["WARN"]
+        assert lin2["view_revision"] == 2 and lin2["matched_groups"] == []
+
+        # 旧修订保留合并前的分组切片，第一份文件可回溯核对
+        rev1 = [a for a in store.rows("aggregation_view")
+                if a.get("视图名称") == "merge-view" and a.get("view_revision") == 1][0]
+        assert set(rev1["results"]) == {"INFO", "WARN"}
+
+    def test_concurrent_refresh_and_export_publish_consistent_files(self, pipeline):
+        """导出与刷新并发：只发布可核对筛选依据的完整文件。"""
+        self._make_view(pipeline, "conc-src",
+                        ["INFO", "WARN", "INFO", "WARN"], "conc-view")
+
+        def refresher():
+            for i in range(6):
+                if i == 3:
+                    self._merge_levels()
+                pipeline.refresh_aggregation("conc-view", "level", "time", "count")
+
+        def exporter():
+            for _ in range(6):
+                pipeline.build_export("conc-view", "csv", {"level": "WARN"})
+
+        threads = [threading.Thread(target=refresher), threading.Thread(target=exporter)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        views = [a for a in store.rows("aggregation_view")
+                 if a.get("视图名称") == "conc-view"]
+        by_revision = {int(a["view_revision"]): a for a in views}
+        exports = [e for e in store.rows("data_export") if e.get("view_name") == "conc-view"]
+        assert len(exports) == 6
+        lineages = {l["export_id"]: l for l in store.rows("data_lineage")
+                    if l.get("export_id")}
+
+        file_paths = set()
+        for export in exports:
+            assert export["status"] == "已完成"
+            # 每份文件只发布一份，路径唯一
+            assert export["文件路径"] not in file_paths
+            file_paths.add(export["文件路径"])
+            # 行内容必须等于所绑定修订实际命中的分组
+            revision = by_revision[export["view_revision"]]
+            expected = [k for k in revision["results"] if k == "WARN"]
+            assert export["matched_groups"] == expected
+            assert [row["分组"] for row in export["rows"]] == expected
+            # 血缘中的分组号与文件一致，两个结果可关联
+            lineage = lineages[str(export["id"])]
+            assert lineage["view_revision"] == export["view_revision"]
+            assert lineage["matched_groups"] == expected
+            assert lineage["record_count"] == export["record_count"]
+
+
 class TestCrossModuleSnapshot:
     """跨模块数据快照测试。"""
-
     def test_snapshot_contains_all_modules(self, pipeline, sample_raw_logs):
         pipeline.run_full_pipeline("snap-src", "2026Q1", sample_raw_logs[:3])
 
